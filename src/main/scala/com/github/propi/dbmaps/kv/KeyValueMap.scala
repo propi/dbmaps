@@ -7,9 +7,9 @@ trait KeyValueMap[K, V, VR <: ValueResolver[V]] {
 
   type KV = (K, V)
 
-  def add(kv: KV): Boolean
+  def add(kv: KV): Unit
 
-  final def add(key: K, value: V): Boolean = add(key -> value)
+  final def add(key: K, value: V): Unit = add(key -> value)
 
   final def +(kv: KV): this.type = {
     add(kv)

@@ -7,7 +7,7 @@ trait Removable[K] {
 
   self: KeyValueMap[K, _, _] =>
 
-  def remove(k: K): Boolean
+  def remove(k: K): Unit
 
   final def -(k: K): this.type = {
     remove(k)
