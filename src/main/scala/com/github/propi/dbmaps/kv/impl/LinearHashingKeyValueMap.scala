@@ -33,20 +33,22 @@ class LinearHashingKeyValueMap[K, V, VR <: ValueResolver[V]] private(dir: File,
 
   private sealed trait KeyState {
     val bucket: Bucket
+    val pointer: Long
   }
 
   private object KeyState {
 
     sealed trait Empty extends KeyState {
-      val pointer: Long
-
-      def save(key: Array[Byte], value: V): Filled = {
+      def save(key: Array[Byte], valuePointer: Long): Filled = {
         val buffer = ByteBuffer.allocate(keyValueBytes)
-        val valuePointer = valueStorage.add(value)
         buffer.put(1.toByte).put(key).putLong(valuePointer)
         bucket.storage.channel.write(buffer, pointer)
         numOfKeys += 1
-        Filled(key, valuePointer)(bucket)
+        Filled(pointer, key, valuePointer)(bucket)
+      }
+
+      def save(key: Array[Byte], value: V): Filled = {
+        save(key, valueStorage.add(value))
       }
     }
 
@@ -54,7 +56,13 @@ class LinearHashingKeyValueMap[K, V, VR <: ValueResolver[V]] private(dir: File,
 
     case class NotInit(pointer: Long)(val bucket: Bucket) extends Empty
 
-    case class Filled(key: Array[Byte], value: Long)(val bucket: Bucket) extends KeyState
+    case class Filled(pointer: Long, key: Array[Byte], value: Long)(val bucket: Bucket) extends KeyState {
+      def delete(): Unit = {
+        val buffer = ByteBuffer.allocate(1)
+        buffer.put(2.toByte)
+        bucket.storage.channel.write(buffer, pointer)
+      }
+    }
 
     def apply(bucket: Bucket)(pointer: Long): KeyState = {
       val buffer = ByteBuffer.allocate(keyValueBytes)
@@ -64,7 +72,7 @@ class LinearHashingKeyValueMap[K, V, VR <: ValueResolver[V]] private(dir: File,
           case 1 =>
             val key = new Array[Byte](serializationSize.size)
             val value = buffer.get(key).getLong
-            Filled(key, value)(bucket)
+            Filled(pointer, key, value)(bucket)
           case 2 => Deleted(pointer)(bucket)
           case _ => NotInit(pointer)(bucket)
         }
@@ -118,7 +126,27 @@ class LinearHashingKeyValueMap[K, V, VR <: ValueResolver[V]] private(dir: File,
   }
 
   private object HmapStorage extends Storage(new File(dir, "h.map"), bucketSize) {
-
+    def addBucket(): Unit = {
+      numOfBuckets += 1
+      val lowerBucket = getBucket(lowerHashedKey(getMaxHashedKey))
+      val lowerBucketKeys = lowerBucket.keys.view ++ lowerBucket.nextPointer.toTraversable.view.map(OverflowStorage.getBucket).flatMap(_.keysRecursively)
+      for (key <- lowerBucketKeys) {
+        val newHashedKey = getHashedKey(Deserializer.deserialize[K](key.key))
+        val newBucket = getBucket(newHashedKey)
+        if (newBucket.pointer != lowerBucket.pointer) {
+          key.delete()
+          val emptySlot = newBucket.findEmpty match {
+            case Left(x) => x
+            case Right(_) => newBucket.nextPointer.map(OverflowStorage.getBucket).map(_.findEmptyRecursively) match {
+              case Some(Left(x)) => x
+              case Some(Right(overflowBucket)) => overflowBucket.addNextBucket(OverflowStorage.createBucket)
+              case None => newBucket.addNextBucket(OverflowStorage.createBucket)
+            }
+          }
+          emptySlot.save(key.key, key.value)
+        }
+      }
+    }
   }
 
   private class Bucket private(val keyStates: Traversable[KeyState], val pointer: Long, _nextPointer: => Option[Long])(implicit val storage: Storage) {
@@ -139,11 +167,40 @@ class LinearHashingKeyValueMap[K, V, VR <: ValueResolver[V]] private(dir: File,
       KeyState.NotInit(newBucket.pointer)(newBucket)
     }
 
+    def keys: Traversable[KeyState.Filled] = keyStates.view.collect {
+      case x: KeyState.Filled => x
+    }
+
+    def keysRecursively: Traversable[KeyState.Filled] = {
+      @scala.annotation.tailrec
+      def nextKeys(bucket: Bucket, result: Traversable[KeyState.Filled]): Traversable[KeyState.Filled] = {
+        bucket.nextBucket match {
+          case Some(x) => nextKeys(x, result.view ++ bucket.keys)
+          case None => result.view ++ bucket.keys
+        }
+      }
+
+      nextKeys(this, Nil)
+    }
+
+    def findEmpty: Either[KeyState.Empty, Bucket] = keyStates.collectFirst {
+      case x: KeyState.Empty => x
+    }.toLeft(this)
+
+    @scala.annotation.tailrec
+    final def findEmptyRecursively: Either[KeyState.Empty, Bucket] = findEmpty match {
+      case x@Left(_) => x
+      case x@Right(_) => nextBucket match {
+        case Some(x) => x.findEmptyRecursively
+        case None => x
+      }
+    }
+
     def findKey(key: Array[Byte]): Either[KeyState, Bucket] = {
       var emptySlot = Option.empty[KeyState]
       for (keyState <- keyStates) {
         keyState match {
-          case x@KeyState.Filled(k, _) if util.Arrays.equals(key, k) => return Left(x)
+          case x@KeyState.Filled(_, k, _) if util.Arrays.equals(key, k) => return Left(x)
           case x: KeyState.NotInit => return Left(x)
           case x: KeyState.Deleted if emptySlot.isEmpty => emptySlot = Some(x)
           case _ =>
@@ -151,11 +208,6 @@ class LinearHashingKeyValueMap[K, V, VR <: ValueResolver[V]] private(dir: File,
       }
       emptySlot.map(Left(_)).getOrElse(Right(this))
     }
-
-  }
-
-  object Bucket {
-
 
   }
 
@@ -246,10 +298,16 @@ class LinearHashingKeyValueMap[K, V, VR <: ValueResolver[V]] private(dir: File,
     }
   }*/
 
+  private def getMaxHashedKey: Int = numOfBuckets - 1
+
+  private def lowerHashedKey(hashedKey: Int): Int = {
+    Integer.parseInt(Integer.toBinaryString(hashedKey).drop(1))
+  }
+
   private def getHashedKey(k: K): Int = {
     val bs = Integer.toBinaryString(k.hashCode()).takeRight(numOfBits)
     val x = Integer.parseInt(bs, 2)
-    if (x > numOfBuckets - 1) {
+    if (x > getMaxHashedKey) {
       Integer.parseInt(bs.drop(1), 2)
     } else {
       x
@@ -265,7 +323,7 @@ class LinearHashingKeyValueMap[K, V, VR <: ValueResolver[V]] private(dir: File,
         case x: KeyState.Filled => valueStorage.get(x.value).add(kv._2)
         case x: KeyState.Empty => x.bucket.nextPointer match {
           case Some(overflowPointer) => OverflowStorage.findKeyRecursively(key, OverflowStorage.getBucket(overflowPointer)) match {
-            case Left(KeyState.Filled(_, v)) => valueStorage.get(v).add(kv._2)
+            case Left(KeyState.Filled(_, _, v)) => valueStorage.get(v).add(kv._2)
             case _ => x.save(key, kv._2)
           }
           case None => x.save(key, kv._2)
@@ -274,10 +332,13 @@ class LinearHashingKeyValueMap[K, V, VR <: ValueResolver[V]] private(dir: File,
       case Right(fullBucket) => fullBucket.nextPointer
         .map(op => OverflowStorage.findKeyRecursively(key, OverflowStorage.getBucket(op)))
         .getOrElse(Right(fullBucket)) match {
-        case Left(KeyState.Filled(_, v)) => valueStorage.get(v).add(kv._2)
+        case Left(KeyState.Filled(_, _, v)) => valueStorage.get(v).add(kv._2)
         case Left(x: KeyState.Empty) => x.save(key, kv._2)
         case Right(bucket) => bucket.addNextBucket(OverflowStorage.createBucket).save(key, kv._2)
       }
+    }
+    if (shouldAdjust) {
+      HmapStorage.addBucket()
     }
   }
 

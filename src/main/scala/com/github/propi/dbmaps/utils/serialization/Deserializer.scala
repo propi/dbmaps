@@ -37,6 +37,8 @@ object Deserializer {
     }
   }
 
+  def deserialize[T](x: Array[Byte])(implicit deserializer: Deserializer[T], serializationSize: SerializationSize[T]): T = deserialize[T](new ByteArrayInputStream(x))
+
   def deserializeOpt[T](is: InputStream)(implicit deserializer: Deserializer[T], serializationSize: SerializationSize[T]): Option[T] = Try(deserialize[T](is)) match {
     case Success(x) => Some(x)
     case Failure(_: EOFException) => None
